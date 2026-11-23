@@ -1,28 +1,30 @@
-# قرار | Qarar AI
-**محرك دعم القرار وجدولة العمليات الذكي**  
-*Universal AI Decision & Resource Optimization Dashboard*
+# ⚡ قرار | Qarar AI
+**منصة دعم القرار وجدولة العمليات الذكية (Enterprise Plug & Play Decision Platform)**
 
 ---
 
-## نظرة عامة | Overview
-**قرار (Qarar AI)** هو تطبيق ويب تفاعلي مبني بلغة Python و Streamlit، يعتمد على محرك **Google OR-Tools (CP-SAT)** لحل مسائل الجدولة وتخصيص الموارد بشكل عام (Plug & Play) دون التقيد بصناعة محددة.
+## المعمارية الهندسية | System Architecture
 
-**Qarar AI** is a universal, domain-agnostic decision support and operations scheduling dashboard powered by **Google OR-Tools (CP-SAT)**, **Streamlit**, and **Plotly**.
+```mermaid
+flowchart LR
+    A[ملفات الشركة XLSX / CSV] --> B[core/data_adapter.py\nالمطابقة الذكية للأعمدة]
+    B --> C[core/solver_engine.py\nGoogle OR-Tools CP-SAT]
+    C --> D[app.py\nلوحة التحكم التنفيذية 4 تبويبات]
+    C --> E[core/ai_advisor.py\nالمستشار التنفيذي والأسئلة]
+    C --> F[utils/report_generator.py\nتقارير Excel & HTML]
+```
 
 ---
 
 ## المميزات الرئيسية | Key Features
-- **واجهة عربية تنفيذية (RTL):** تصميم نظيف وسهل الاستخدام.
-- **قالب Excel قياسي (3 أوراق):** `Resources`، `Orders`، `Stock` مع إمكانية التحميل والرفع والتعديل المباشر.
-- **محرك تحسين ذكي (OR-Tools):** يدعم سعات الموارد، أوقات التجهيز (Setup Time)، المواعيد النهائية (Deadlines)، وتوافر المخزون.
-- **أهداف متعددة:** تقليل زمن التسليم الكلي (Minimize Makespan) أو تقليل التكلفة التشغيلية (Minimize Cost).
-- **مخطط جانت التفاعلي (Gantt Chart):** عرض مرئي تفاعلي باستخدام `plotly.express.bar` مع تصدير خطة التنفيذ.
+1. **مركز البيانات والربط الذكي:** دعم `.xlsx` و `.csv` مع مطابقة ذكية للأعمدة (عربي/إنجليزي) و 3 قوالب قطاعات جاهزة.
+2. **غرفة العمليات والخطة المثلى:** تحسين متعدد الأهداف (أسرع تسليم / أقل تكلفة / توازن ذكي)، مخطط جانت، وكاشف الاختناقات.
+3. **محاكي السيناريوهات (What-If):** محاكاة زيادة الطلب، الأعطال، الساعات الإضافية، وعجز المخزون مع مقارنة فورية.
+4. **التنبؤ المالي والتقارير:** تحليل هيكل التكاليف، حساب الوفر (ROI)، وتصدير تقارير Excel و HTML.
 
 ---
 
-## التشغيل السريع | Quick Start
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+## النشر السحابي | Streamlit Community Cloud
+1. ادفع الكود إلى مستودع GitHub (`https://github.com/darshstudio2026/Qarar.git`).
+2. افتح [share.streamlit.io](https://share.streamlit.io) واختر المستودع والفرع `main` والملف `app.py`.
+3. اضغط **Deploy**.

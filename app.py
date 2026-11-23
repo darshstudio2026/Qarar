@@ -1,17 +1,18 @@
 import io
-from typing import Dict, Tuple
-
-import openpyxl  # noqa: F401 - required for pandas Excel I/O
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from ortools.sat.python import cp_model
+
+from core.ai_advisor import answer_question, generate_executive_summary
+from core.data_adapter import get_industry_preset, load_uploaded_file
+from core.solver_engine import solve_schedule
+from utils.report_generator import generate_excel_report, generate_html_report
 
 # -----------------------------------------------------------------------------
-# Page Configuration & Arabic RTL Executive Styling
+# Page Configuration & Executive Arabic RTL Styling
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="قرار | Qarar AI",
+    page_title="قرار | Qarar AI — منصة دعم القرار",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -29,15 +30,16 @@ st.markdown(
         gap: 8px;
     }
     .stTabs [data-baseweb="tab"] {
-        padding: 8px 16px;
-        border-radius: 6px;
+        padding: 10px 18px;
+        border-radius: 8px;
+        font-weight: 600;
     }
     div[data-testid="stMetric"] {
         background-color: #f8fafc;
         border: 1px solid #e2e8f0;
         padding: 14px 18px;
         border-radius: 10px;
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
     }
     </style>
     """,
@@ -45,316 +47,268 @@ st.markdown(
 )
 
 
-# -----------------------------------------------------------------------------
-# Generic Sample Data (100% Domain-Agnostic)
-# -----------------------------------------------------------------------------
-def get_sample_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    resources_df = pd.DataFrame(
-        [
-            {"resource_id": "R-01", "resource_name": "وحدة تشغيل أ", "capacity": 1, "hourly_cost": 120, "setup_time_hours": 1},
-            {"resource_id": "R-02", "resource_name": "وحدة تشغيل ب", "capacity": 1, "hourly_cost": 95, "setup_time_hours": 1},
-            {"resource_id": "R-03", "resource_name": "وحدة تشغيل ج", "capacity": 2, "hourly_cost": 150, "setup_time_hours": 2},
-        ]
-    )
-
-    orders_df = pd.DataFrame(
-        [
-            {"order_id": "ORD-101", "order_name": "أمر عمل 101", "required_resource_id": "R-01", "duration_hours": 4, "deadline_hour": 14, "material_id": "MAT-01", "material_qty": 20, "priority": 1},
-            {"order_id": "ORD-102", "order_name": "أمر عمل 102", "required_resource_id": "R-01", "duration_hours": 5, "deadline_hour": 18, "material_id": "MAT-02", "material_qty": 15, "priority": 2},
-            {"order_id": "ORD-103", "order_name": "أمر عمل 103", "required_resource_id": "R-02", "duration_hours": 6, "deadline_hour": 16, "material_id": "MAT-01", "material_qty": 25, "priority": 1},
-            {"order_id": "ORD-104", "order_name": "أمر عمل 104", "required_resource_id": "R-02", "duration_hours": 3, "deadline_hour": 20, "material_id": "MAT-03", "material_qty": 10, "priority": 3},
-            {"order_id": "ORD-105", "order_name": "أمر عمل 105", "required_resource_id": "R-03", "duration_hours": 7, "deadline_hour": 22, "material_id": "MAT-02", "material_qty": 30, "priority": 2},
-            {"order_id": "ORD-106", "order_name": "أمر عمل 106", "required_resource_id": "R-03", "duration_hours": 4, "deadline_hour": 15, "material_id": "MAT-03", "material_qty": 12, "priority": 1},
-        ]
-    )
-
-    stock_df = pd.DataFrame(
-        [
-            {"material_id": "MAT-01", "material_name": "مادة أساسية 1", "available_qty": 100, "unit": "وحدة"},
-            {"material_id": "MAT-02", "material_name": "مادة أساسية 2", "available_qty": 80, "unit": "وحدة"},
-            {"material_id": "MAT-03", "material_name": "مادة أساسية 3", "available_qty": 60, "unit": "وحدة"},
-        ]
-    )
-    return resources_df, orders_df, stock_df
-
-
-def to_excel_bytes(resources_df: pd.DataFrame, orders_df: pd.DataFrame, stock_df: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        resources_df.to_excel(writer, sheet_name="Resources", index=False)
-        orders_df.to_excel(writer, sheet_name="Orders", index=False)
-        stock_df.to_excel(writer, sheet_name="Stock", index=False)
-    return output.getvalue()
+def to_template_bytes(res_df: pd.DataFrame, ord_df: pd.DataFrame, stk_df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        res_df.to_excel(writer, sheet_name="Resources", index=False)
+        ord_df.to_excel(writer, sheet_name="Orders", index=False)
+        stk_df.to_excel(writer, sheet_name="Stock", index=False)
+    return buf.getvalue()
 
 
 # -----------------------------------------------------------------------------
-# Generic OR-Tools CP-SAT Optimization Engine
+# Sidebar: AI Advisor Key & Global Settings
 # -----------------------------------------------------------------------------
-def solve_schedule(
-    resources_df: pd.DataFrame,
-    orders_df: pd.DataFrame,
-    stock_df: pd.DataFrame,
-    objective_mode: str,
-) -> Dict:
-    if resources_df.empty or orders_df.empty:
-        return {"status": "ERROR", "message": "يجب توفر بيانات الموارد والطلبات لتشغيل المحرك."}
-
-    res_map = resources_df.set_index("resource_id").to_dict(orient="index")
-    stock_map = (
-        stock_df.set_index("material_id")["available_qty"].to_dict()
-        if not stock_df.empty and "material_id" in stock_df.columns
-        else {}
-    )
-
-    # Validate material stock availability
-    if "material_id" in orders_df.columns and "material_qty" in orders_df.columns:
-        required_stock = orders_df.groupby("material_id")["material_qty"].sum().to_dict()
-        shortages = []
-        for mat_id, req_qty in required_stock.items():
-            avail = stock_map.get(mat_id, 0)
-            if req_qty > avail:
-                shortages.append(f"{mat_id} (المطلوب: {req_qty}، المتاح: {avail})")
-        if shortages:
-            return {
-                "status": "ERROR",
-                "message": "عجز في المخزون للمواد التالية: " + " | ".join(shortages),
-            }
-
-    model = cp_model.CpModel()
-
-    # Compute safe upper bound horizon
-    total_horizon = 0
-    for _, order in orders_df.iterrows():
-        r_id = order["required_resource_id"]
-        if r_id not in res_map:
-            return {"status": "ERROR", "message": f"المورد '{r_id}' غير موجود في جدول الموارد."}
-        setup = int(res_map[r_id].get("setup_time_hours", 0))
-        dur = int(order["duration_hours"])
-        total_horizon += dur + setup
-    horizon = max(total_horizon, int(orders_df["deadline_hour"].max()) if not orders_df.empty else 100)
-
-    intervals_by_resource: Dict[str, list] = {r_id: [] for r_id in res_map}
-    order_vars = []
-    total_cost_terms = []
-
-    for idx, order in orders_df.iterrows():
-        o_id = str(order["order_id"])
-        o_name = str(order.get("order_name", o_id))
-        r_id = str(order["required_resource_id"])
-        res_info = res_map[r_id]
-
-        dur = max(1, int(order["duration_hours"]))
-        setup = max(0, int(res_info.get("setup_time_hours", 0)))
-        effective_dur = dur + setup
-        deadline = int(order["deadline_hour"])
-        hourly_cost = int(res_info.get("hourly_cost", 0))
-
-        start_var = model.NewIntVar(0, horizon, f"start_{o_id}_{idx}")
-        end_var = model.NewIntVar(0, horizon, f"end_{o_id}_{idx}")
-        interval_var = model.NewIntervalVar(start_var, effective_dur, end_var, f"interval_{o_id}_{idx}")
-
-        # Deadline constraint
-        model.Add(end_var <= deadline)
-
-        intervals_by_resource[r_id].append(interval_var)
-        order_cost = effective_dur * hourly_cost
-        total_cost_terms.append(order_cost)
-
-        order_vars.append(
-            {
-                "order_id": o_id,
-                "order_name": o_name,
-                "resource_id": r_id,
-                "resource_name": str(res_info.get("resource_name", r_id)),
-                "duration_hours": dur,
-                "setup_time_hours": setup,
-                "effective_duration": effective_dur,
-                "deadline_hour": deadline,
-                "hourly_cost": hourly_cost,
-                "order_cost": order_cost,
-                "start_var": start_var,
-                "end_var": end_var,
-            }
-        )
-
-    # Resource capacity & non-overlapping constraints
-    for r_id, intervals in intervals_by_resource.items():
-        if not intervals:
-            continue
-        cap = max(1, int(res_map[r_id].get("capacity", 1)))
-        if cap == 1:
-            model.AddNoOverlap(intervals)
-        else:
-            model.AddCumulative(intervals, [1] * len(intervals), cap)
-
-    makespan = model.NewIntVar(0, horizon, "makespan")
-    model.AddMaxEquality(makespan, [ov["end_var"] for ov in order_vars])
-
-    if "Makespan" in objective_mode:
-        model.Minimize(makespan)
-    else:
-        # Minimize Cost primary, Makespan secondary tie-breaker
-        total_cost = sum(total_cost_terms)
-        model.Minimize(total_cost * 1000 + makespan)
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 15.0
-    status = solver.Solve(model)
-
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {
-            "status": "INFEASIBLE",
-            "message": "لم يتم العثور على جدول زمني يحقق جميع القيود والمواعيد النهائية. يرجى مراجعة السعات أو المواعيد النهائية.",
-        }
-
-    schedule_rows = []
-    for ov in order_vars:
-        s = solver.Value(ov["start_var"])
-        e = solver.Value(ov["end_var"])
-        schedule_rows.append(
-            {
-                "رقم الطلب": ov["order_id"],
-                "اسم الطلب": ov["order_name"],
-                "المورد": ov["resource_name"],
-                "رمز المورد": ov["resource_id"],
-                "وقت البدء (ساعة)": s,
-                "وقت الانتهاء (ساعة)": e,
-                "مدة التنفيذ (ساعة)": ov["duration_hours"],
-                "وقت التجهيز (ساعة)": ov["setup_time_hours"],
-                "المدة الإجمالية (ساعة)": ov["effective_duration"],
-                "الموعد النهائي (ساعة)": ov["deadline_hour"],
-                "التكلفة التشغيلية": ov["order_cost"],
-            }
-        )
-
-    schedule_df = pd.DataFrame(schedule_rows).sort_values(by=["وقت البدء (ساعة)", "رقم الطلب"]).reset_index(drop=True)
-    total_makespan = int(solver.Value(makespan))
-    total_cost_val = int(sum(ov["order_cost"] for ov in order_vars))
-    total_active_hours = int(sum(ov["effective_duration"] for ov in order_vars))
-    total_available_capacity = sum(max(1, int(res_map[r]["capacity"])) * max(1, total_makespan) for r in res_map)
-    utilization = round((total_active_hours / total_available_capacity) * 100, 1) if total_available_capacity > 0 else 0.0
-
-    return {
-        "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
-        "schedule_df": schedule_df,
-        "makespan": total_makespan,
-        "total_cost": total_cost_val,
-        "utilization": utilization,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Main UI
-# -----------------------------------------------------------------------------
-st.title("⚡ قرار | Qarar AI")
-st.caption("محرك دعم القرار وجدولة العمليات الذكي — Universal AI Decision & Resource Optimization Dashboard")
-
 with st.sidebar:
-    st.header("⚙️ إعدادات البيانات")
-    use_sample = st.toggle("استخدام بيانات تجريبية جاهزة", value=True)
+    st.title("⚡ قرار | Qarar AI")
+    st.caption("منصة دعم القرار وجدولة العمليات الذكية")
+    st.divider()
 
-    sample_res, sample_ord, sample_stk = get_sample_data()
-    template_bytes = to_excel_bytes(sample_res, sample_ord, sample_stk)
-
-    st.download_button(
-        label="📥 تحميل قالب Excel القياسي (3 أوراق)",
-        data=template_bytes,
-        file_name="qarar_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-    uploaded_file = st.file_uploader(
-        "رفع ملف Excel مخصص (.xlsx)",
-        type=["xlsx"],
-        help="يجب أن يحتوي الملف على 3 أوراق: Resources, Orders, Stock",
-    )
+    st.subheader("🤖 المستشار التنفيذي (AI)")
+    ai_provider = st.selectbox("مزود الذكاء الاصطناعي (اختياري)", ["OpenAI", "Claude", "Gemini"])
+    api_key = st.text_input("مفتاح API (اختياري)", type="password", help="في حال عدم الإدخال، يعمل المحرك الذكي المدمج تلقائياً.")
 
     st.divider()
-    st.header("🎯 هدف التحسين")
-    objective_choice = st.radio(
-        "اختر معيار التحسين الأساسي:",
-        options=[
+    st.subheader("🎯 معيار التحسين الأساسي")
+    objective_mode = st.radio(
+        "اختر هدف المحرك:",
+        [
             "أسرع وقت تسليم | Minimize Makespan",
             "أقل تكلفة تشغيلية | Minimize Cost",
+            "توازن ذكي | Balanced",
         ],
     )
 
-# Load Data
-if uploaded_file is not None and not use_sample:
-    try:
-        excel_data = pd.read_excel(uploaded_file, sheet_name=None)
-        resources_df = excel_data.get("Resources", sample_res)
-        orders_df = excel_data.get("Orders", sample_ord)
-        stock_df = excel_data.get("Stock", sample_stk)
-    except Exception as exc:
-        st.error(f"تعذر قراءة ملف Excel: {exc}")
-        resources_df, orders_df, stock_df = sample_res, sample_ord, sample_stk
-else:
-    resources_df, orders_df, stock_df = sample_res, sample_ord, sample_stk
+# Initialize session state with default preset
+if "resources_df" not in st.session_state:
+    r0, o0, s0 = get_industry_preset("مصنع تصنيع وتجميع")
+    st.session_state["resources_df"] = r0
+    st.session_state["orders_df"] = o0
+    st.session_state["stock_df"] = s0
 
-# Editable Data Tabs
-st.subheader("📋 مدخلات النظام (قابلة للتعديل المباشر)")
-tab_res, tab_ord, tab_stk = st.tabs(["الموارد | Resources", "الطلبات | Orders", "المخزون | Stock"])
+st.title("⚡ قرار | Qarar AI — منصة دعم القرار وجدولة العمليات")
 
-with tab_res:
-    edited_resources = st.data_editor(resources_df, num_rows="dynamic", use_container_width=True, key="res_editor")
+tab1, tab2, tab3, tab4 = st.tabs([
+    "1️⃣ مركز البيانات والربط الذكي",
+    "2️⃣ غرفة العمليات والخطة المثلى",
+    "3️⃣ محاكي السيناريوهات (What-If)",
+    "4️⃣ التنبؤ المالي والتقارير التنفيذية",
+])
 
-with tab_ord:
-    edited_orders = st.data_editor(orders_df, num_rows="dynamic", use_container_width=True, key="ord_editor")
-
-with tab_stk:
-    edited_stock = st.data_editor(stock_df, num_rows="dynamic", use_container_width=True, key="stk_editor")
-
-st.divider()
-
-# Run Optimization
-if st.button("🚀 تشغيل محرك القرار الذكي (Optimize)", type="primary", use_container_width=True):
-    with st.spinner("جاري حل نموذج الجدولة باستخدام Google OR-Tools..."):
-        result = solve_schedule(edited_resources, edited_orders, edited_stock, objective_choice)
-
-    if result["status"] in ("ERROR", "INFEASIBLE"):
-        st.error(result["message"])
-    else:
-        st.success("✅ تم إيجاد الجدول الزمني الأمثل بنجاح!")
-
-        # Executive KPI Cards
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("إجمالي الطلبات المجدولة", f"{len(result['schedule_df'])}")
-        k2.metric("زمن التنفيذ الكلي (Makespan)", f"{result['makespan']} ساعة")
-        k3.metric("التكلفة التشغيلية المقدرة", f"{result['total_cost']:,}")
-        k4.metric("نسبة استغلال الموارد", f"{result['utilization']}%")
-
-        # Interactive Horizontal Gantt Chart (plotly.express.bar)
-        st.subheader("📊 مخطط جانت التفاعلي (Gantt Chart)")
-        df_plot = result["schedule_df"].copy()
-        fig = px.bar(
-            df_plot,
-            base="وقت البدء (ساعة)",
-            x="المدة الإجمالية (ساعة)",
-            y="المورد",
-            color="اسم الطلب",
-            orientation="h",
-            hover_data=["رقم الطلب", "وقت البدء (ساعة)", "وقت الانتهاء (ساعة)", "الموعد النهائي (ساعة)", "التكلفة التشغيلية"],
-            title="الجدول الزمني لتوزيع العمليات على الموارد",
+# =============================================================================
+# TAB 1: مركز البيانات والربط الذكي (Data & Smart Mapping)
+# =============================================================================
+with tab1:
+    st.subheader("🔌 قوالب القطاعات الجاهزة (Plug & Play Presets)")
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        if st.button("🏭 مصنع تصنيع وتجميع", use_container_width=True):
+            r, o, s = get_industry_preset("مصنع تصنيع وتجميع")
+            st.session_state["resources_df"], st.session_state["orders_df"], st.session_state["stock_df"] = r, o, s
+            st.rerun()
+    with p2:
+        if st.button("🚚 شركة توزيع ولوجستيات", use_container_width=True):
+            r, o, s = get_industry_preset("شركة توزيع ولوجستيات")
+            st.session_state["resources_df"], st.session_state["orders_df"], st.session_state["stock_df"] = r, o, s
+            st.rerun()
+    with p3:
+        if st.button("👥 إدارة مشاريع وفرق عمل", use_container_width=True):
+            r, o, s = get_industry_preset("إدارة مشاريع وفرق عمل")
+            st.session_state["resources_df"], st.session_state["orders_df"], st.session_state["stock_df"] = r, o, s
+            st.rerun()
+    with p4:
+        tpl = to_template_bytes(
+            st.session_state["resources_df"],
+            st.session_state["orders_df"],
+            st.session_state["stock_df"],
         )
-        fig.update_layout(
-            xaxis_title="الزمن (بالساعات)",
-            yaxis_title="المورد",
-            barmode="overlay",
-            height=420,
-            legend_title="الطلبات",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Exportable Execution Plan Table
-        st.subheader("📑 خطة التنفيذ التفصيلية")
-        st.dataframe(df_plot, use_container_width=True)
-
-        csv_bytes = df_plot.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            label="⬇️ تصدير خطة التنفيذ (CSV)",
-            data=csv_bytes,
-            file_name="qarar_execution_plan.csv",
-            mime="text/csv",
+            "📥 تحميل قالب Excel",
+            data=tpl,
+            file_name="qarar_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )
+
+    st.divider()
+    st.subheader("📤 رفع ملفات الشركة (.xlsx / .csv) مع المطابقة الذكية للأعمدة")
+    uploaded = st.file_uploader("اسحب وأفلت ملف Excel أو CSV هنا", type=["xlsx", "csv"])
+    if uploaded is not None:
+        try:
+            r_up, o_up, s_up, map_report = load_uploaded_file(uploaded)
+            st.session_state["resources_df"] = r_up
+            st.session_state["orders_df"] = o_up
+            st.session_state["stock_df"] = s_up
+            st.success("✅ تم استيراد الملف ومطابقة الأعمدة تلقائياً!")
+            with st.expander("عرض تفاصيل المطابقة الذكية للأعمدة (Auto-Column Mapping)"):
+                st.json(map_report)
+        except Exception as exc:
+            st.error(f"تعذر قراءة الملف: {exc}")
+
+    st.subheader("📋 الجداول الحية (قابلة للتعديل المباشر)")
+    gt1, gt2, gt3 = st.tabs(["الموارد | Resources", "الطلبات | Orders", "المخزون | Stock"])
+    with gt1:
+        st.session_state["resources_df"] = st.data_editor(
+            st.session_state["resources_df"], num_rows="dynamic", use_container_width=True, key="ed_res"
+        )
+    with gt2:
+        st.session_state["orders_df"] = st.data_editor(
+            st.session_state["orders_df"], num_rows="dynamic", use_container_width=True, key="ed_ord"
+        )
+    with gt3:
+        st.session_state["stock_df"] = st.data_editor(
+            st.session_state["stock_df"], num_rows="dynamic", use_container_width=True, key="ed_stk"
+        )
+
+# Run Baseline Optimization
+baseline_result = solve_schedule(
+    st.session_state["resources_df"],
+    st.session_state["orders_df"],
+    st.session_state["stock_df"],
+    objective_mode=objective_mode,
+)
+
+# =============================================================================
+# TAB 2: غرفة العمليات والخطة المثلى (Optimization & Action Plan)
+# =============================================================================
+with tab2:
+    if baseline_result["status"] in ("ERROR", "INFEASIBLE"):
+        st.error(baseline_result["message"])
+        for b in baseline_result.get("bottlenecks", []):
+            st.warning(f"⚠️ {b}")
+    else:
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("إجمالي الطلبات المجدولة", f"{len(baseline_result['schedule_df'])}")
+        k2.metric("زمن التنفيذ الكلي (Makespan)", f"{baseline_result['makespan']} ساعة")
+        k3.metric("التكلفة التشغيلية", f"{baseline_result['total_cost']:,}")
+        k4.metric("نسبة استغلال الموارد", f"{baseline_result['utilization']}%")
+
+        col_gantt, col_util = st.columns([2, 1])
+        with col_gantt:
+            st.subheader("📊 مخطط جانت التفاعلي (Gantt Chart)")
+            df_plot = baseline_result["schedule_df"]
+            fig_gantt = px.bar(
+                df_plot,
+                base="وقت البدء (ساعة)",
+                x="المدة الإجمالية (ساعة)",
+                y="المورد",
+                color="اسم الطلب",
+                orientation="h",
+                hover_data=["رقم الطلب", "وقت البدء (ساعة)", "وقت الانتهاء (ساعة)", "الموعد النهائي (ساعة)"],
+            )
+            fig_gantt.update_layout(xaxis_title="الزمن (ساعة)", yaxis_title="المورد", barmode="overlay", height=380)
+            st.plotly_chart(fig_gantt, use_container_width=True)
+
+        with col_util:
+            st.subheader("⚙️ استغلال الموارد (%)")
+            util_df = baseline_result["utilization_df"]
+            fig_util = px.bar(
+                util_df,
+                x="المورد",
+                y="نسبة الاستغلال (%)",
+                color="نسبة الاستغلال (%)",
+                color_continuous_scale="Blues",
+            )
+            fig_util.update_layout(height=380)
+            st.plotly_chart(fig_util, use_container_width=True)
+
+        st.divider()
+        col_ai, col_bn = st.columns([2, 1])
+        with col_ai:
+            summary_md = generate_executive_summary(baseline_result, api_key=api_key, provider=ai_provider)
+            st.markdown(summary_md)
+            user_q = st.text_input("💬 اسأل المستشار الذكي عن الخطة (مثال: ما هي التكلفة؟ أو ما هي الاختناقات؟)")
+            if user_q:
+                st.info(answer_question(user_q, baseline_result, api_key=api_key))
+
+        with col_bn:
+            st.subheader("🚨 كاشف الاختناقات")
+            bns = baseline_result.get("bottlenecks", [])
+            if bns:
+                for b in bns:
+                    st.warning(b)
+            else:
+                st.success("✅ لا توجد اختناقات حرجة.")
+
+# =============================================================================
+# TAB 3: محاكي السيناريوهات (What-If Simulator)
+# =============================================================================
+with tab3:
+    st.subheader("🎛️ محاكاة الاضطرابات والنمو (What-If Simulator)")
+    c_sim1, c_sim2, c_sim3, c_sim4 = st.columns(4)
+    with c_sim1:
+        demand_surge = st.slider("تغير حجم الطلب / المدة (%)", -30, 100, 0, step=10)
+    with c_sim2:
+        overtime = st.slider("ساعات العمل الإضافية (Overtime)", 0, 24, 0, step=2)
+    with c_sim3:
+        stock_pct = st.slider("توافر المخزون (%)", 20, 150, 100, step=10)
+    with c_sim4:
+        all_res_ids = st.session_state["resources_df"]["resource_id"].astype(str).tolist()
+        disabled_res = st.multiselect("تعطيل موارد (صيانة/عطل)", options=all_res_ids)
+
+    sim_result = solve_schedule(
+        st.session_state["resources_df"],
+        st.session_state["orders_df"],
+        st.session_state["stock_df"],
+        objective_mode=objective_mode,
+        overtime_hours=overtime,
+        disabled_resources=disabled_res,
+        demand_multiplier=1.0 + (demand_surge / 100.0),
+        stock_multiplier=stock_pct / 100.0,
+    )
+
+    st.divider()
+    if sim_result["status"] in ("ERROR", "INFEASIBLE"):
+        st.error(f"❌ السيناريو غير قابل للتنفيذ: {sim_result['message']}")
+    elif baseline_result["status"] not in ("ERROR", "INFEASIBLE"):
+        d_time = sim_result["makespan"] - baseline_result["makespan"]
+        d_cost = sim_result["total_cost"] - baseline_result["total_cost"]
+        d_util = round(sim_result["utilization"] - baseline_result["utilization"], 1)
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("زمن التنفيذ (السيناريو)", f"{sim_result['makespan']} ساعة", delta=f"{d_time:+} ساعة", delta_color="inverse")
+        s2.metric("التكلفة (السيناريو)", f"{sim_result['total_cost']:,}", delta=f"{d_cost:+,}", delta_color="inverse")
+        s3.metric("استغلال الموارد", f"{sim_result['utilization']}%", delta=f"{d_util:+}%")
+        st.dataframe(sim_result["schedule_df"], use_container_width=True)
+
+# =============================================================================
+# TAB 4: التنبؤ المالي والتقارير التنفيذية (Financial Impact & Export)
+# =============================================================================
+with tab4:
+    if baseline_result["status"] in ("ERROR", "INFEASIBLE"):
+        st.warning("يرجى حل الخطة الأساسية أولاً لعرض التحليل المالي والتقارير.")
+    else:
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("تكلفة الإنتاج", f"{baseline_result['prod_cost']:,}")
+        f2.metric("تكلفة التجهيز (Setup)", f"{baseline_result['setup_cost']:,}")
+        f3.metric("تكلفة الخمول المقدرة", f"{baseline_result['idle_cost']:,}")
+        f4.metric("الوفر التقديري (ROI)", f"{baseline_result['estimated_savings']:,}")
+
+        cost_df = pd.DataFrame([
+            {"البند": "تكلفة الإنتاج", "القيمة": baseline_result["prod_cost"]},
+            {"البند": "تكلفة التجهيز", "القيمة": baseline_result["setup_cost"]},
+            {"البند": "تكلفة الخمول المقدرة", "القيمة": baseline_result["idle_cost"]},
+        ])
+        fig_cost = px.pie(cost_df, names="البند", values="القيمة", title="توزيع هيكل التكاليف التشغيلية", hole=0.4)
+        st.plotly_chart(fig_cost, use_container_width=True)
+
+        st.subheader("📥 تصدير التقارير التنفيذية")
+        e1, e2 = st.columns(2)
+        with e1:
+            excel_bytes = generate_excel_report(baseline_result)
+            st.download_button(
+                "📊 تحميل التقرير التنفيذي الكامل (Excel)",
+                data=excel_bytes,
+                file_name="qarar_executive_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with e2:
+            html_report = generate_html_report(baseline_result)
+            st.download_button(
+                "📄 تحميل الملخص التنفيذي للطباعة (HTML)",
+                data=html_report.encode("utf-8"),
+                file_name="qarar_executive_summary.html",
+                mime="text/html",
+                use_container_width=True,
+            )
