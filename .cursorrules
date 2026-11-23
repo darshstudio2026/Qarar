@@ -1,0 +1,23 @@
+# Qarar AI (قرار) - Strict Agent & Development Rules
+
+1. Zero Breaking Changes:
+   - Never break existing working features (`Resources`, `Orders`, `Stock`, Gantt chart, OR-Tools solver).
+   - Preserve all 3 standardized Excel sheets (`Resources`, `Orders`, `Stock`) and their schemas.
+
+2. Universal Plug & Play Architecture:
+   - Keep the optimization engine 100% generic.
+   - Never hardcode industry-specific names, categories, or domain labels inside the solver logic.
+
+3. Auto-Test Before Finishing:
+   - Verify Python syntax (`python3 -m py_compile app.py`) and runtime (`streamlit run app.py`) so Streamlit runs with zero errors.
+
+4. Auto-Git Commit & Push:
+   - Stage and commit all changes after every task (`git add . && git commit -m "..."`).
+   - Push to the active working branch.
+
+5. Mandatory Arabic Mini-Report:
+   - End EVERY response with a concise Arabic Mini-Report showing:
+     - (✅ ما تم إنجازه)
+     - (🧪 حالة الاختبار)
+     - (🔗 حالة Git والربط بـ GitHub)
+     - (⏭️ الخطوة المقترحة التالية)
