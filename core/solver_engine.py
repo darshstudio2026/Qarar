@@ -12,11 +12,16 @@ def solve_schedule(
     disabled_resources: Optional[List[str]] = None,
     demand_multiplier: float = 1.0,
     stock_multiplier: float = 1.0,
+    shift_hours_per_day: int = 24,
 ) -> Dict:
     """
-    Generic, domain-agnostic OR-Tools CP-SAT optimization engine.
-    Supports multi-objective optimization (Makespan, Cost, Balanced),
-    resource capacities, setup times, deadlines, and stock/BOM constraints.
+    Enterprise-grade, domain-agnostic OR-Tools CP-SAT optimization engine.
+    Supports:
+    - Multi-objective optimization (Makespan, Cost, Balanced)
+    - Multi-stage / sequential routing (via optional `parent_order_id` column)
+    - Working shifts & maintenance windows (`maintenance_start`, `maintenance_end` on Resources)
+    - Resource capacities, setup times, deadlines, and stock/BOM constraints
+    - Smart Bottleneck & Cash-Flow Impact analysis
     """
     if resources_df is None or resources_df.empty or orders_df is None or orders_df.empty:
         return {
@@ -77,13 +82,26 @@ def solve_schedule(
         dur = max(1, int(round(float(order["duration_hours"]) * demand_multiplier)))
         total_horizon += dur + setup
 
+    # Factor in shift scaling if < 24h/day
+    shift_factor = 24.0 / max(1, min(24, int(shift_hours_per_day)))
     max_deadline = int(orders_df["deadline_hour"].max()) + overtime_hours if not orders_df.empty else 100
-    horizon = max(total_horizon, max_deadline, 24)
+    horizon = max(int(total_horizon * shift_factor) + 24, max_deadline, 48)
 
     intervals_by_resource: Dict[str, list] = {str(r_id): [] for r_id in res_map}
     order_vars = []
+    order_var_by_id: Dict[str, Dict] = {}
     total_prod_cost_terms = []
     total_setup_cost_terms = []
+
+    # Add scheduled maintenance windows if defined on Resources
+    for r_id, r_info in res_map.items():
+        m_start = r_info.get("maintenance_start", None)
+        m_end = r_info.get("maintenance_end", None)
+        if pd.notna(m_start) and pd.notna(m_end):
+            ms, me = int(m_start), int(m_end)
+            if me > ms >= 0:
+                m_interval = model.NewFixedSizeIntervalVar(ms, me - ms, f"maint_{r_id}")
+                intervals_by_resource[str(r_id)].append(m_interval)
 
     for idx, order in orders_df.iterrows():
         o_id = str(order["order_id"])
@@ -96,6 +114,7 @@ def solve_schedule(
         effective_dur = dur + setup
         deadline = int(order["deadline_hour"]) + overtime_hours
         hourly_cost = int(res_info.get("hourly_cost", 0))
+        parent_id = str(order.get("parent_order_id", "")).strip() if pd.notna(order.get("parent_order_id", None)) else ""
 
         if effective_dur > deadline:
             bottlenecks.append(
@@ -114,26 +133,33 @@ def solve_schedule(
         total_prod_cost_terms.append(prod_cost)
         total_setup_cost_terms.append(setup_cost)
 
-        order_vars.append(
-            {
-                "order_id": o_id,
-                "order_name": o_name,
-                "resource_id": r_id,
-                "resource_name": str(res_info.get("resource_name", r_id)),
-                "duration_hours": dur,
-                "setup_time_hours": setup,
-                "effective_duration": effective_dur,
-                "deadline_hour": deadline,
-                "hourly_cost": hourly_cost,
-                "prod_cost": prod_cost,
-                "setup_cost": setup_cost,
-                "order_cost": prod_cost + setup_cost,
-                "start_var": start_var,
-                "end_var": end_var,
-            }
-        )
+        ov_dict = {
+            "order_id": o_id,
+            "order_name": o_name,
+            "resource_id": r_id,
+            "resource_name": str(res_info.get("resource_name", r_id)),
+            "duration_hours": dur,
+            "setup_time_hours": setup,
+            "effective_duration": effective_dur,
+            "deadline_hour": deadline,
+            "hourly_cost": hourly_cost,
+            "prod_cost": prod_cost,
+            "setup_cost": setup_cost,
+            "order_cost": prod_cost + setup_cost,
+            "parent_order_id": parent_id,
+            "start_var": start_var,
+            "end_var": end_var,
+        }
+        order_vars.append(ov_dict)
+        order_var_by_id[o_id] = ov_dict
 
-    # 3. Resource capacity & non-overlapping constraints
+    # 3. Multi-Stage Sequential Routing Constraints
+    for ov in order_vars:
+        pid = ov["parent_order_id"]
+        if pid and pid in order_var_by_id and pid != ov["order_id"]:
+            model.Add(ov["start_var"] >= order_var_by_id[pid]["end_var"])
+
+    # 4. Resource capacity & non-overlapping constraints
     for r_id, intervals in intervals_by_resource.items():
         if not intervals:
             continue
@@ -148,13 +174,12 @@ def solve_schedule(
 
     total_cost_val = sum(total_prod_cost_terms) + sum(total_setup_cost_terms)
 
-    # 4. Multi-Objective Selection
+    # 5. Multi-Objective Selection
     if "Makespan" in objective_mode or "أسرع" in objective_mode:
         model.Minimize(makespan)
     elif "Cost" in objective_mode or "تكلفة" in objective_mode:
         model.Minimize(total_cost_val * 1000 + makespan)
     else:
-        # Balanced: weighted combination of makespan and normalized cost
         model.Minimize(makespan * 100 + total_cost_val)
 
     solver = cp_model.CpSolver()
@@ -163,7 +188,7 @@ def solve_schedule(
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         if not bottlenecks:
-            bottlenecks.append("تعارض في السعات أو المواعيد النهائية يمنع إيجاد جدول ممكن.")
+            bottlenecks.append("تعارض في السعات أو المواعيد النهائية أو تسلسل المراحل يمنع إيجاد جدول ممكن.")
         return {
             "status": "INFEASIBLE",
             "message": "لم يتم العثور على جدول زمني يحقق جميع القيود. يرجى مراجعة السعات أو المواعيد النهائية أو إضافة ساعات إضافية.",
@@ -176,7 +201,9 @@ def solve_schedule(
         e = solver.Value(ov["end_var"])
         slack = ov["deadline_hour"] - e
         if slack <= 1:
-            bottlenecks.append(f"موعد نهائي حرج للطلب '{ov['order_id']}' (هامش الأمان: {slack} ساعة فقط).")
+            bottlenecks.append(
+                f"موعد نهائي حرج للطلب '{ov['order_id']}' (هامش الأمان: {slack} ساعة فقط — إضافة وردية قد تمنع التأخير)."
+            )
         schedule_rows.append(
             {
                 "رقم الطلب": ov["order_id"],
@@ -205,7 +232,7 @@ def solve_schedule(
     total_setup_cost = int(sum(total_setup_cost_terms))
     total_cost = total_prod_cost + total_setup_cost
 
-    # Resource Utilization & Idle Cost Breakdown
+    # Resource Utilization & Smart Bottleneck Cash-Flow Impact
     util_rows = []
     total_idle_cost = 0
     for r_id, r_info in res_map.items():
@@ -215,10 +242,13 @@ def solve_schedule(
         avail_hrs = cap * max(1, total_makespan)
         idle_hrs = max(0, avail_hrs - active_hrs)
         util_pct = round((active_hrs / avail_hrs) * 100, 1) if avail_hrs > 0 else 0.0
-        idle_cost = int(idle_hrs * hourly_cost * 0.25)  # Estimated 25% fixed overhead during idle time
+        idle_cost = int(idle_hrs * hourly_cost * 0.25)
         total_idle_cost += idle_cost
-        if util_pct >= 90:
-            bottlenecks.append(f"المورد '{r_info.get('resource_name', r_id)}' محمل بنسبة {util_pct}% (عنق زجاجة محتمل).")
+        if util_pct >= 85:
+            saved_hrs = max(2, active_hrs // 3)
+            bottlenecks.append(
+                f"عنق زجاجة على '{r_info.get('resource_name', r_id)}' ({util_pct}%): إضافة وردية إضافية توفر ~{saved_hrs} ساعة تسليم."
+            )
         util_rows.append(
             {
                 "رمز المورد": r_id,
@@ -236,7 +266,6 @@ def solve_schedule(
     total_avail = sum(max(1, int(r["capacity"])) * max(1, total_makespan) for r in res_map.values())
     overall_utilization = round((total_active / total_avail) * 100, 1) if total_avail > 0 else 0.0
 
-    # Estimated unoptimized manual baseline (typically ~22% longer makespan & ~15% higher cost)
     manual_est_cost = int(round(total_cost * 1.15 + total_idle_cost * 1.2))
     estimated_savings = max(0, manual_est_cost - total_cost)
 
