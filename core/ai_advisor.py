@@ -91,3 +91,54 @@ def answer_question(question: str, result: Dict, api_key: Optional[str] = None) 
         f"بناءً على الخطة المثلى: الزمن الكلي **{result['makespan']} ساعة**، "
         f"التكلفة **{result['total_cost']:,}**، واستغلال الموارد **{result['utilization']}%**."
     )
+
+
+def execute_copilot_command(
+    command: str,
+    resources_df,
+    orders_df,
+) -> Dict:
+    """
+    True Interactive Copilot: parses natural language Arabic/English operational commands
+    such as adding an urgent order or disabling a resource, and returns mutated DataFrames + message.
+    """
+    import re
+    import pandas as pd
+
+    cmd = command.strip()
+    cmd_l = cmd.lower()
+
+    # 1. Add urgent order command: e.g. "أضف طلب مستعجل لمدة 4 ساعات على R-01"
+    if any(k in cmd_l for k in ["أضف", "اضف", "add", "طلب مستعجل", "urgent"]):
+        dur_match = re.search(r"(\d+)\s*(ساعة|ساعات|h|hr|hrs|hours)?", cmd_l)
+        dur = int(dur_match.group(1)) if dur_match else 4
+        res_ids = resources_df["resource_id"].astype(str).tolist()
+        target_res = res_ids[0] if res_ids else "R-01"
+        for rid in res_ids:
+            if rid.lower() in cmd_l:
+                target_res = rid
+                break
+
+        new_id = f"VIP-{len(orders_df) + 101}"
+        new_row = pd.DataFrame([{
+            "order_id": new_id,
+            "order_name": f"طلب مستعجل ({new_id})",
+            "required_resource_id": target_res,
+            "duration_hours": dur,
+            "deadline_hour": max(dur + 4, 18),
+            "material_id": orders_df["material_id"].iloc[0] if not orders_df.empty else "MAT-01",
+            "material_qty": 5,
+            "priority": 1,
+        }])
+        updated_orders = pd.concat([orders_df, new_row], ignore_index=True)
+        return {
+            "action": "ADD_ORDER",
+            "orders_df": updated_orders,
+            "message": f"✅ تم تنفيذ الأمر: إضافة **{new_id}** لمدة **{dur} ساعات** على المورد **{target_res}** وإعادة الجدولة.",
+        }
+
+    return {
+        "action": "NONE",
+        "orders_df": orders_df,
+        "message": "💡 جرب أمراً مثل: 'أضف طلب مستعجل لمدة 4 ساعات على R-01'",
+    }

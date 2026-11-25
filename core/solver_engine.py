@@ -13,15 +13,18 @@ def solve_schedule(
     demand_multiplier: float = 1.0,
     stock_multiplier: float = 1.0,
     shift_hours_per_day: int = 24,
+    frozen_schedule_df: Optional[pd.DataFrame] = None,
+    current_hour: int = 0,
 ) -> Dict:
     """
     Enterprise-grade, domain-agnostic OR-Tools CP-SAT optimization engine.
     Supports:
     - Multi-objective optimization (Makespan, Cost, Balanced)
+    - Flexible Alternative Resource Routing (comma-separated resource IDs)
+    - Dynamic Real-Time Rescheduling (frozen_schedule_df + current_hour)
     - Multi-stage / sequential routing (via optional `parent_order_id` column)
     - Working shifts & maintenance windows (`maintenance_start`, `maintenance_end` on Resources)
     - Resource capacities, setup times, deadlines, and stock/BOM constraints
-    - Smart Bottleneck & Cash-Flow Impact analysis
     """
     if resources_df is None or resources_df.empty or orders_df is None or orders_df.empty:
         return {
@@ -50,6 +53,16 @@ def solve_schedule(
         else {}
     )
 
+    # Map frozen orders if dynamic rescheduling is active
+    frozen_map: Dict[str, Dict] = {}
+    if frozen_schedule_df is not None and not frozen_schedule_df.empty and current_hour > 0:
+        for _, frow in frozen_schedule_df.iterrows():
+            if int(frow["وقت البدء (ساعة)"]) < current_hour:
+                frozen_map[str(frow["رقم الطلب"])] = {
+                    "start": int(frow["وقت البدء (ساعة)"]),
+                    "resource_id": str(frow["رمز المورد"]),
+                }
+
     bottlenecks: List[str] = []
 
     # 1. Validate material stock availability
@@ -74,15 +87,15 @@ def solve_schedule(
     # 2. Compute safe upper bound horizon
     total_horizon = 0
     for _, order in orders_df.iterrows():
-        r_id = str(order["required_resource_id"])
-        if r_id not in res_map:
-            msg = f"المورد '{r_id}' غير متاح أو معطل في جدول الموارد."
+        raw_res = str(order["required_resource_id"])
+        candidates = [c.strip() for c in raw_res.split(",") if c.strip() in res_map]
+        if not candidates:
+            msg = f"المورد '{raw_res}' غير متاح أو معطل في جدول الموارد."
             return {"status": "ERROR", "message": msg, "bottlenecks": [msg]}
-        setup = max(0, int(res_map[r_id].get("setup_time_hours", 0)))
+        max_setup = max(max(0, int(res_map[c].get("setup_time_hours", 0))) for c in candidates)
         dur = max(1, int(round(float(order["duration_hours"]) * demand_multiplier)))
-        total_horizon += dur + setup
+        total_horizon += dur + max_setup
 
-    # Factor in shift scaling if < 24h/day
     shift_factor = 24.0 / max(1, min(24, int(shift_hours_per_day)))
     max_deadline = int(orders_df["deadline_hour"].max()) + overtime_hours if not orders_df.empty else 100
     horizon = max(int(total_horizon * shift_factor) + 24, max_deadline, 48)
@@ -90,8 +103,7 @@ def solve_schedule(
     intervals_by_resource: Dict[str, list] = {str(r_id): [] for r_id in res_map}
     order_vars = []
     order_var_by_id: Dict[str, Dict] = {}
-    total_prod_cost_terms = []
-    total_setup_cost_terms = []
+    total_cost_terms = []
 
     # Add scheduled maintenance windows if defined on Resources
     for r_id, r_info in res_map.items():
@@ -106,49 +118,59 @@ def solve_schedule(
     for idx, order in orders_df.iterrows():
         o_id = str(order["order_id"])
         o_name = str(order.get("order_name", o_id))
-        r_id = str(order["required_resource_id"])
-        res_info = res_map[r_id]
+        raw_res = str(order["required_resource_id"])
+        candidates = [c.strip() for c in raw_res.split(",") if c.strip() in res_map]
 
         dur = max(1, int(round(float(order["duration_hours"]) * demand_multiplier)))
-        setup = max(0, int(res_info.get("setup_time_hours", 0)))
-        effective_dur = dur + setup
         deadline = int(order["deadline_hour"]) + overtime_hours
-        hourly_cost = int(res_info.get("hourly_cost", 0))
         parent_id = str(order.get("parent_order_id", "")).strip() if pd.notna(order.get("parent_order_id", None)) else ""
-
-        if effective_dur > deadline:
-            bottlenecks.append(
-                f"الطلب '{o_id}' ({o_name}) يتطلب {effective_dur} ساعة بينما الموعد النهائي {deadline} ساعة."
-            )
 
         start_var = model.NewIntVar(0, horizon, f"start_{o_id}_{idx}")
         end_var = model.NewIntVar(0, horizon, f"end_{o_id}_{idx}")
-        interval_var = model.NewIntervalVar(start_var, effective_dur, end_var, f"interval_{o_id}_{idx}")
-
         model.Add(end_var <= deadline)
-        intervals_by_resource[r_id].append(interval_var)
 
-        prod_cost = dur * hourly_cost
-        setup_cost = setup * hourly_cost
-        total_prod_cost_terms.append(prod_cost)
-        total_setup_cost_terms.append(setup_cost)
+        # Pin frozen orders if they already started before current_hour
+        if o_id in frozen_map and frozen_map[o_id]["resource_id"] in candidates:
+            model.Add(start_var == frozen_map[o_id]["start"])
+            candidates = [frozen_map[o_id]["resource_id"]]
+        elif current_hour > 0 and o_id not in frozen_map:
+            model.Add(start_var >= current_hour)
+
+        presence_vars = []
+        chosen_cost_terms = []
+
+        for r_id in candidates:
+            res_info = res_map[r_id]
+            setup = max(0, int(res_info.get("setup_time_hours", 0)))
+            effective_dur = dur + setup
+            hourly_cost = int(res_info.get("hourly_cost", 0))
+            cand_cost = effective_dur * hourly_cost
+
+            if len(candidates) == 1:
+                interval_var = model.NewIntervalVar(start_var, effective_dur, end_var, f"int_{o_id}_{r_id}_{idx}")
+                intervals_by_resource[r_id].append(interval_var)
+                total_cost_terms.append(cand_cost)
+                presence_vars.append((r_id, None, effective_dur, setup, cand_cost, dur * hourly_cost, setup * hourly_cost))
+            else:
+                p_var = model.NewBoolVar(f"pres_{o_id}_{r_id}_{idx}")
+                opt_int = model.NewOptionalIntervalVar(start_var, effective_dur, end_var, p_var, f"opt_{o_id}_{r_id}_{idx}")
+                intervals_by_resource[r_id].append(opt_int)
+                chosen_cost_terms.append(p_var * cand_cost)
+                presence_vars.append((r_id, p_var, effective_dur, setup, cand_cost, dur * hourly_cost, setup * hourly_cost))
+
+        if len(candidates) > 1:
+            model.AddExactlyOne([pv[1] for pv in presence_vars])
+            total_cost_terms.append(sum(chosen_cost_terms))
 
         ov_dict = {
             "order_id": o_id,
             "order_name": o_name,
-            "resource_id": r_id,
-            "resource_name": str(res_info.get("resource_name", r_id)),
             "duration_hours": dur,
-            "setup_time_hours": setup,
-            "effective_duration": effective_dur,
             "deadline_hour": deadline,
-            "hourly_cost": hourly_cost,
-            "prod_cost": prod_cost,
-            "setup_cost": setup_cost,
-            "order_cost": prod_cost + setup_cost,
             "parent_order_id": parent_id,
             "start_var": start_var,
             "end_var": end_var,
+            "presence_vars": presence_vars,
         }
         order_vars.append(ov_dict)
         order_var_by_id[o_id] = ov_dict
@@ -172,15 +194,14 @@ def solve_schedule(
     makespan = model.NewIntVar(0, horizon, "makespan")
     model.AddMaxEquality(makespan, [ov["end_var"] for ov in order_vars])
 
-    total_cost_val = sum(total_prod_cost_terms) + sum(total_setup_cost_terms)
+    total_cost_expr = sum(total_cost_terms)
 
-    # 5. Multi-Objective Selection
     if "Makespan" in objective_mode or "أسرع" in objective_mode:
         model.Minimize(makespan)
     elif "Cost" in objective_mode or "تكلفة" in objective_mode:
-        model.Minimize(total_cost_val * 1000 + makespan)
+        model.Minimize(total_cost_expr * 1000 + makespan)
     else:
-        model.Minimize(makespan * 100 + total_cost_val)
+        model.Minimize(makespan * 100 + total_cost_expr)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 15.0
@@ -196,28 +217,46 @@ def solve_schedule(
         }
 
     schedule_rows = []
+    total_prod_cost = 0
+    total_setup_cost = 0
+    active_hrs_by_res: Dict[str, int] = {r_id: 0 for r_id in res_map}
+
     for ov in order_vars:
         s = solver.Value(ov["start_var"])
         e = solver.Value(ov["end_var"])
         slack = ov["deadline_hour"] - e
+
+        # Determine chosen resource
+        chosen = ov["presence_vars"][0]
+        for pv in ov["presence_vars"]:
+            if pv[1] is None or solver.Value(pv[1]) == 1:
+                chosen = pv
+                break
+
+        r_id, _, eff_dur, setup_hrs, o_cost, p_cost, s_cost = chosen
+        total_prod_cost += p_cost
+        total_setup_cost += s_cost
+        active_hrs_by_res[r_id] += eff_dur
+
         if slack <= 1:
             bottlenecks.append(
                 f"موعد نهائي حرج للطلب '{ov['order_id']}' (هامش الأمان: {slack} ساعة فقط — إضافة وردية قد تمنع التأخير)."
             )
+
         schedule_rows.append(
             {
                 "رقم الطلب": ov["order_id"],
                 "اسم الطلب": ov["order_name"],
-                "المورد": ov["resource_name"],
-                "رمز المورد": ov["resource_id"],
+                "المورد": str(res_map[r_id].get("resource_name", r_id)),
+                "رمز المورد": r_id,
                 "وقت البدء (ساعة)": s,
                 "وقت الانتهاء (ساعة)": e,
                 "مدة التنفيذ (ساعة)": ov["duration_hours"],
-                "وقت التجهيز (ساعة)": ov["setup_time_hours"],
-                "المدة الإجمالية (ساعة)": ov["effective_duration"],
+                "وقت التجهيز (ساعة)": setup_hrs,
+                "المدة الإجمالية (ساعة)": eff_dur,
                 "الموعد النهائي (ساعة)": ov["deadline_hour"],
                 "هامش الأمان (ساعة)": slack,
-                "التكلفة التشغيلية": ov["order_cost"],
+                "التكلفة التشغيلية": o_cost,
             }
         )
 
@@ -228,17 +267,14 @@ def solve_schedule(
     )
 
     total_makespan = int(solver.Value(makespan))
-    total_prod_cost = int(sum(total_prod_cost_terms))
-    total_setup_cost = int(sum(total_setup_cost_terms))
     total_cost = total_prod_cost + total_setup_cost
 
-    # Resource Utilization & Smart Bottleneck Cash-Flow Impact
     util_rows = []
     total_idle_cost = 0
     for r_id, r_info in res_map.items():
         cap = max(1, int(r_info.get("capacity", 1)))
         hourly_cost = int(r_info.get("hourly_cost", 0))
-        active_hrs = sum(ov["effective_duration"] for ov in order_vars if ov["resource_id"] == r_id)
+        active_hrs = active_hrs_by_res[r_id]
         avail_hrs = cap * max(1, total_makespan)
         idle_hrs = max(0, avail_hrs - active_hrs)
         util_pct = round((active_hrs / avail_hrs) * 100, 1) if avail_hrs > 0 else 0.0
@@ -262,7 +298,7 @@ def solve_schedule(
         )
 
     utilization_df = pd.DataFrame(util_rows)
-    total_active = int(sum(ov["effective_duration"] for ov in order_vars))
+    total_active = sum(active_hrs_by_res.values())
     total_avail = sum(max(1, int(r["capacity"])) * max(1, total_makespan) for r in res_map.values())
     overall_utilization = round((total_active / total_avail) * 100, 1) if total_avail > 0 else 0.0
 

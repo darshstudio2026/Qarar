@@ -110,6 +110,17 @@ def load_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
     return res_df, ord_df, stk_df, mapping_report
 
 
+def load_from_url(url: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Live Two-Way Sync: Loads Orders directly from a Google Sheets CSV export URL or any CSV URL.
+    """
+    clean_url = url.strip()
+    if "docs.google.com/spreadsheets" in clean_url and "/edit" in clean_url:
+        clean_url = clean_url.split("/edit")[0] + "/export?format=csv"
+    raw_df = pd.read_csv(clean_url)
+    return auto_map_columns(raw_df, "Orders")
+
+
 def get_industry_preset(preset_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     1-Click Industry Presets demonstrating universal Plug & Play versatility.

@@ -4,8 +4,9 @@ import plotly.express as px
 import streamlit as st
 from streamlit_option_menu import option_menu
 
-from core.ai_advisor import answer_question, generate_executive_summary
-from core.data_adapter import get_industry_preset, load_uploaded_file
+from core.ai_advisor import answer_question, execute_copilot_command, generate_executive_summary
+from core.data_adapter import get_industry_preset, load_from_url, load_uploaded_file
+from core.risk_engine import run_monte_carlo_risk
 from core.database import (
     get_optimization_history,
     get_or_create_demo_company,
@@ -272,17 +273,29 @@ if selected_nav == "مركز البيانات والربط":
         )
 
     st.divider()
-    uploaded = st.file_uploader("📤 رفع ملف الشركة (.xlsx / .csv) مع المطابقة الذكية للأعمدة", type=["xlsx", "csv"])
-    if uploaded is not None:
-        try:
-            r_up, o_up, s_up, map_report = load_uploaded_file(uploaded)
-            st.session_state["resources_df"], st.session_state["orders_df"], st.session_state["stock_df"] = r_up, o_up, s_up
-            save_company_data(cid, r_up, o_up, s_up)
-            st.success("✅ تم استيراد الملف وحفظه في قاعدة بيانات الشركة!")
-            with st.expander("تفاصيل المطابقة الذكية للأعمدة"):
-                st.json(map_report)
-        except Exception as exc:
-            st.error(f"تعذر قراءة الملف: {exc}")
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        uploaded = st.file_uploader("📤 رفع ملف الشركة (.xlsx / .csv) مع المطابقة الذكية للأعمدة", type=["xlsx", "csv"])
+        if uploaded is not None:
+            try:
+                r_up, o_up, s_up, map_report = load_uploaded_file(uploaded)
+                st.session_state["resources_df"], st.session_state["orders_df"], st.session_state["stock_df"] = r_up, o_up, s_up
+                save_company_data(cid, r_up, o_up, s_up)
+                st.success("✅ تم استيراد الملف وحفظه في قاعدة بيانات الشركة!")
+                with st.expander("تفاصيل المطابقة الذكية للأعمدة"):
+                    st.json(map_report)
+            except Exception as exc:
+                st.error(f"تعذر قراءة الملف: {exc}")
+    with col_up2:
+        gs_url = st.text_input("🔗 مزامنة حية مع Google Sheets / CSV URL", placeholder="https://docs.google.com/spreadsheets/d/...")
+        if st.button("🔄 سحب البيانات من الرابط", use_container_width=True) and gs_url:
+            try:
+                o_url, url_map = load_from_url(gs_url)
+                st.session_state["orders_df"] = o_url
+                save_company_data(cid, st.session_state["resources_df"], o_url, st.session_state["stock_df"])
+                st.success("✅ تمت المزامنة الحية للطلبات بنجاح!")
+            except Exception as exc:
+                st.error(f"تعذر السحب من الرابط: {exc}")
 
     gt1, gt2, gt3 = st.tabs(["الموارد | Resources", "الطلبات | Orders", "المخزون | Stock"])
     with gt1:
@@ -365,9 +378,19 @@ elif selected_nav == "غرفة العمليات المثلى":
         col_ai, col_bn = st.columns([2, 1])
         with col_ai:
             st.markdown(generate_executive_summary(baseline_result, api_key=api_key, provider=ai_provider))
-            user_q = st.text_input("💬 اسأل المستشار الذكي عن الخطة:")
+            user_q = st.text_input("💬 اسأل المستشار الذكي أو أعطه أمراً (مثال: أضف طلب مستعجل لمدة 4 ساعات على R-01):")
             if user_q:
-                st.info(answer_question(user_q, baseline_result, api_key=api_key))
+                if any(k in user_q.lower() for k in ["أضف", "اضف", "add", "طلب مستعجل"]):
+                    cop = execute_copilot_command(user_q, st.session_state["resources_df"], st.session_state["orders_df"])
+                    if cop["action"] == "ADD_ORDER":
+                        st.session_state["orders_df"] = cop["orders_df"]
+                        save_company_data(cid, st.session_state["resources_df"], cop["orders_df"], st.session_state["stock_df"])
+                        st.success(cop["message"])
+                        st.rerun()
+                    else:
+                        st.info(cop["message"])
+                else:
+                    st.info(answer_question(user_q, baseline_result, api_key=api_key))
         with col_bn:
             st.subheader("🚨 كاشف الاختناقات")
             bns = baseline_result.get("bottlenecks", [])
@@ -418,6 +441,24 @@ elif selected_nav == "محاكي السيناريوهات":
         s2.metric("التكلفة (السيناريو)", f"{sim_result['total_cost']:,}", delta=f"{d_cost:+,}", delta_color="inverse")
         s3.metric("استغلال الموارد", f"{sim_result['utilization']}%", delta=f"{d_util:+}%")
         st.dataframe(sim_result["schedule_df"], use_container_width=True)
+
+    st.divider()
+    st.subheader("🎲 تحليل المخاطر بالمحاكاة العشوائية (Monte Carlo AI Auto-Pilot)")
+    if st.button("⚡ تشغيل 30 محاكاة مخاطر تلقائية", use_container_width=True):
+        with st.spinner("جاري تشغيل 30 سيناريو عشوائي لقياس موثوقية التسليم..."):
+            mc = run_monte_carlo_risk(
+                st.session_state["resources_df"],
+                st.session_state["orders_df"],
+                st.session_state["stock_df"],
+                objective_mode=objective_mode,
+                shift_hours_per_day=shift_hours,
+                n_simulations=30,
+            )
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("احتمالية التسليم في الموعد", f"{mc['on_time_probability']}%")
+        m2.metric("مستوى المخاطرة", mc["risk_level"])
+        m3.metric("متوسط الزمن المتوقع", f"{mc['avg_makespan']} ساعة")
+        m4.metric("التكلفة الحرجة (P95)", f"{mc['p95_cost']:,}")
 
 # =============================================================================
 # VIEW 4: التنبؤ المالي والتقارير
