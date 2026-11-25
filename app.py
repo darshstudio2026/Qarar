@@ -40,42 +40,61 @@ st.markdown(
         font-family: 'Cairo', sans-serif !important;
         direction: rtl;
         text-align: right;
+        background: linear-gradient(180deg, #F8FAFC 0%, #EFF6FF 100%);
+    }
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0F172A 0%, #1E293B 100%);
+        color: #F8FAFC;
+    }
+    section[data-testid="stSidebar"] * {
+        color: #E2E8F0;
     }
     .exec-header {
-        background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
+        background: linear-gradient(135deg, #0F172A 0%, #1E3A8A 60%, #0F172A 100%);
         color: #FFFFFF;
-        padding: 16px 24px;
-        border-radius: 14px;
-        margin-bottom: 20px;
+        padding: 20px 28px;
+        border-radius: 16px;
+        margin-bottom: 24px;
         display: flex;
         justify-content: space-between;
         align-items: center;
-        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.15);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 12px 32px rgba(15, 23, 42, 0.18);
+        border: 1px solid rgba(255, 255, 255, 0.12);
     }
     .exec-badge {
-        background: rgba(16, 185, 129, 0.18);
-        color: #10B981;
+        background: rgba(16, 185, 129, 0.2);
+        color: #34D399;
         border: 1px solid #10B981;
-        padding: 4px 12px;
-        border-radius: 20px;
+        padding: 6px 14px;
+        border-radius: 24px;
         font-size: 0.85rem;
         font-weight: 700;
+        letter-spacing: 0.3px;
     }
     div[data-testid="stMetric"] {
-        background: rgba(248, 250, 252, 0.9);
-        backdrop-filter: blur(10px);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(12px);
         border: 1px solid #E2E8F0;
-        border-right: 4px solid #3B82F6;
-        padding: 16px 20px;
-        border-radius: 12px;
-        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
+        border-right: 5px solid #3B82F6;
+        padding: 18px 22px;
+        border-radius: 14px;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    div[data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.1);
     }
     .stButton > button {
         border-radius: 10px;
         font-family: 'Cairo', sans-serif !important;
         font-weight: 700;
+        padding: 8px 16px;
         transition: all 0.2s ease;
+    }
+    .stButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.25);
     }
     </style>
     """,
