@@ -195,13 +195,18 @@ def solve_schedule(
     model.AddMaxEquality(makespan, [ov["end_var"] for ov in order_vars])
 
     total_cost_expr = sum(total_cost_terms)
+    # Priority-weighted completion time (high priority = lower number = higher weight)
+    weighted_completion = sum(
+        ov["end_var"] * max(1, 5 - int(orders_df.iloc[i].get("priority", 2)))
+        for i, ov in enumerate(order_vars)
+    )
 
     if "Makespan" in objective_mode or "أسرع" in objective_mode:
-        model.Minimize(makespan)
+        model.Minimize(makespan * 1000 + weighted_completion)
     elif "Cost" in objective_mode or "تكلفة" in objective_mode:
-        model.Minimize(total_cost_expr * 1000 + makespan)
+        model.Minimize(total_cost_expr * 1000 + makespan * 10 + weighted_completion)
     else:
-        model.Minimize(makespan * 100 + total_cost_expr)
+        model.Minimize(makespan * 100 + total_cost_expr + weighted_completion * 5)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 15.0
