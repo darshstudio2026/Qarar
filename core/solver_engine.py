@@ -3,6 +3,51 @@ import pandas as pd
 from ortools.sat.python import cp_model
 
 
+def _sanitize_dataframes(
+    resources_df: pd.DataFrame,
+    orders_df: pd.DataFrame,
+    stock_df: Optional[pd.DataFrame],
+):
+    """
+    Sanitizes input DataFrames by dropping empty/NaN primary-ID rows
+    and coercing all numeric columns to safe defaults.
+    """
+    res = resources_df.copy()
+    res = res.dropna(subset=["resource_id"])
+    res["resource_id"] = res["resource_id"].astype(str).str.strip()
+    res = res[~res["resource_id"].isin(["", "nan", "None", "none"])]
+    for col, default in [("capacity", 1), ("hourly_cost", 0), ("setup_time_hours", 0)]:
+        if col in res.columns:
+            res[col] = pd.to_numeric(res[col], errors="coerce").fillna(default)
+        else:
+            res[col] = default
+
+    ord_df = orders_df.copy()
+    ord_df = ord_df.dropna(subset=["order_id", "required_resource_id"])
+    ord_df["order_id"] = ord_df["order_id"].astype(str).str.strip()
+    ord_df["required_resource_id"] = ord_df["required_resource_id"].astype(str).str.strip()
+    ord_df = ord_df[~ord_df["order_id"].isin(["", "nan", "None", "none"]) & ~ord_df["required_resource_id"].isin(["", "nan", "None", "none"])]
+    for col, default in [("duration_hours", 1), ("deadline_hour", 24), ("material_qty", 0), ("priority", 2)]:
+        if col in ord_df.columns:
+            ord_df[col] = pd.to_numeric(ord_df[col], errors="coerce").fillna(default)
+        else:
+            ord_df[col] = default
+
+    if stock_df is not None and not stock_df.empty and "material_id" in stock_df.columns:
+        stk = stock_df.copy()
+        stk = stk.dropna(subset=["material_id"])
+        stk["material_id"] = stk["material_id"].astype(str).str.strip()
+        stk = stk[stk["material_id"] != ""]
+        if "available_qty" in stk.columns:
+            stk["available_qty"] = pd.to_numeric(stk["available_qty"], errors="coerce").fillna(0)
+        else:
+            stk["available_qty"] = 0
+    else:
+        stk = pd.DataFrame(columns=["material_id", "material_name", "available_qty", "unit"])
+
+    return res, ord_df, stk
+
+
 def solve_schedule(
     resources_df: pd.DataFrame,
     orders_df: pd.DataFrame,

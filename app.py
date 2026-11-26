@@ -203,10 +203,10 @@ with st.sidebar:
         menu_icon="lightning-charge",
         default_index=0,
         styles={
-            "container": {"padding": "4px", "background-color": "#F8FAFC"},
-            "icon": {"color": "#3B82F6", "font-size": "18px"},
-            "nav-link": {"font-family": "Cairo", "font-size": "14px", "text-align": "right"},
-            "nav-link-selected": {"background-color": "#0F172A", "color": "#FFFFFF"},
+            "container": {"padding": "6px", "background-color": "#1E293B", "border-radius": "12px"},
+            "icon": {"color": "#60A5FA", "font-size": "18px"},
+            "nav-link": {"font-family": "Cairo", "font-size": "14px", "text-align": "right", "color": "#E2E8F0", "border-radius": "8px"},
+            "nav-link-selected": {"background-color": "#2563EB", "color": "#FFFFFF", "font-weight": "700"},
         },
     )
 
@@ -318,11 +318,14 @@ if selected_nav == "مركز البيانات والربط":
 
     gt1, gt2, gt3 = st.tabs(["الموارد | Resources", "الطلبات | Orders", "المخزون | Stock"])
     with gt1:
-        st.session_state["resources_df"] = st.data_editor(st.session_state["resources_df"], num_rows="dynamic", use_container_width=True, key="ed_res")
+        ed_res = st.data_editor(st.session_state["resources_df"], num_rows="dynamic", use_container_width=True, key="ed_res")
+        st.session_state["resources_df"] = ed_res.dropna(subset=["resource_id"]) if "resource_id" in ed_res.columns else ed_res
     with gt2:
-        st.session_state["orders_df"] = st.data_editor(st.session_state["orders_df"], num_rows="dynamic", use_container_width=True, key="ed_ord")
+        ed_ord = st.data_editor(st.session_state["orders_df"], num_rows="dynamic", use_container_width=True, key="ed_ord")
+        st.session_state["orders_df"] = ed_ord.dropna(subset=["order_id"]) if "order_id" in ed_ord.columns else ed_ord
     with gt3:
-        st.session_state["stock_df"] = st.data_editor(st.session_state["stock_df"], num_rows="dynamic", use_container_width=True, key="ed_stk")
+        ed_stk = st.data_editor(st.session_state["stock_df"], num_rows="dynamic", use_container_width=True, key="ed_stk")
+        st.session_state["stock_df"] = ed_stk.dropna(subset=["material_id"]) if "material_id" in ed_stk.columns else ed_stk
 
     if st.button("💾 حفظ التعديلات في قاعدة البيانات", type="primary"):
         save_company_data(cid, st.session_state["resources_df"], st.session_state["orders_df"], st.session_state["stock_df"])
